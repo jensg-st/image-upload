@@ -1,6 +1,127 @@
-description: A simple 'no-op' state that returns 'Hello world!'
+functions:
+- id: image-magick
+  image: gcr.io/direktiv/functions/image-magick:1.0
+  type: knative-workflow
+- id: nsfw
+  image: gcr.io/direktiv/functions/nsfw:1.0
+  type: knative-workflow
+  size: large
+- id: aws-cli
+  image: gcr.io/direktiv/functions/aws-cli:1.0
+  type: knative-workflow
+
 states:
-- id: helloworld
-  type: noop
+
+# store the uploaded image in instance variable
+- id: store-upload
+  type: setter
+  variables:
+  - scope: instance
+    key: image
+    mimeType: application/octet-stream
+    value: jq(.input)
+  transform: jq(del(.input))
+  transition: get-info
+
+# check for file type, only PNG allowed
+- id: get-info
+  type: action
+  action:
+    function: image-magick
+    files:
+    - scope: instance
+      key: image
+    input: 
+      commands:
+      - command: 'convert -strip image out/instance/converted'
+      - command: 'convert out/instance/converted json:'
   transform:
-    result: Hello world!
+    # get the format from the image magick information json
+    format: jq(.return."image-magick"[1].result[0].image.format)
+    size: jq(.return."image-magick"[1].result[0].image.geometry)
+  transition: check-input
+
+# check for format and size
+- id: check-input
+  type: switch
+  defaultTransition: nsfw
+  conditions:
+  - condition: 'jq(.size.height > 800)'
+    transform: 
+      error: image height larger than 800
+    transition: error
+  - condition: 'jq(.size.width > 1024)'
+    transform: 
+      error: image width larger than 1024
+    transition: error
+  - condition: 'jq(.format != "PNG")'
+    transform: 
+      error: image not a PNG but jq(.format)
+    transition: error
+
+# run nsfw check
+- id: nsfw
+  type: action
+  action:
+    function: nsfw
+    files:
+    - scope: instance
+      key: converted
+    input: 
+      images:
+      - image: converted
+  transition: check-nsfw
+
+# check the nsfw outcome
+- id: check-nsfw
+  type: switch
+  defaultTransition: name-generator
+  log: neutral probabilty jq(.return.nsfw[0].result.converted.neutral * 100 | round) percent
+  conditions:
+  - condition: jq(.return.nsfw[0].result.converted.neutral < 0.80)
+    transition: blur
+
+# blur nsfw images
+- id: blur
+  type: action
+  action:
+    function: image-magick
+    files:
+    - scope: instance
+      key: converted
+    input: 
+      commands:
+      - command: 'convert -blur 0x25 converted out/instance/converted'
+  transition: name-generator
+
+# generate unique name for the file upload
+- id: name-generator
+  type: getter
+  variables:
+  - scope: system
+    key: instance
+  transform:
+    name: jq(.var.instance)
+  transition: upload
+
+# upload to linode bucket
+- id: upload
+  type: action
+  action:
+    function: aws-cli
+    secrets: ["linodeAccess", "linodeSecret", "linodeRegion"]
+    files:
+    - scope: instance
+      key: converted
+    input: 
+      access-key: jq(.secrets.linodeAccess)
+      secret-key: jq(.secrets.linodeSecret)
+      region: jq(.secrets.linodeRegion)
+      commands:
+      - command: aws s3 cp converted s3://direktiv-nsfw/jq(.name).png --endpoint=https://eu-central-1.linodeobjects.com
+  transform: 'jq(del(.return) | { message: ("image " + .name + ".png uploaded to linode S3") } )'
+
+- id: error
+  type: error
+  error: badImageInput
+  message: jq(.error)
